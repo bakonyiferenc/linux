@@ -373,6 +373,15 @@ config BATTERY_MAX17042
 	  with MAX17042. This driver also supports max17047/50 chips which are
 	  improved version of max17042.
 
+config BATTERY_MAX17048
+	tristate "Maxim MAX17048 Fuel Gauge"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  MAX17048 is fuel-gauge systems for lithium-ion (Li+) batteries
+	  in handheld and portable equipment. The MAX17048 is configured
+	  to operate with a single lithium cell
+
 config BATTERY_MAX1721X
 	tristate "MAX17211/MAX17215 standalone gas-gauge"
 	depends on W1
