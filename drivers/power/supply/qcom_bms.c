@@ -49,6 +49,7 @@ struct bms_fcc_lut {
 
 struct bms_device_info {
 	struct device *dev;
+	struct power_supply *batt_psy;
 	struct regmap *regmap;
 	struct power_supply_desc bat_desc;
 	struct power_supply_battery_info info;
@@ -59,6 +60,9 @@ struct bms_device_info {
 
 	int ocv_thr_irq;
 	u32 ocv;
+	s64 cc_uah;
+	s64 prev_cc_uah;
+	int status;
 };
 
 static bool between(int left, int right, int val)
@@ -92,7 +96,7 @@ static int interpolate_capacity(int temp, u32 ocv,
 		}
 
 	// Just debug print our data
-	int g;
+/*	int g;
 	for (g = 0; g < POWER_SUPPLY_OCV_TEMP_MAX; g++) {
 		if(info->ocv_table_size[g] == -EINVAL) {
 			printk("reached -EINVAL for ocv_table_size, breaking...\n");
@@ -107,7 +111,7 @@ static int interpolate_capacity(int temp, u32 ocv,
 			printk("table value: %d , %d\n", info->ocv_table[g][f].ocv, info->ocv_table[g][f].capacity);
 		}
 	}
-
+*/
 	// TODO Maybe use power_supply_ocv2cap_simple or one of the helpers there?
 
 	// if current ocv value is higher than the ocv value for 100% at the `j` temperature
@@ -326,6 +330,9 @@ static int bms_read_cc(struct bms_device_info *di, s64 *cc_uah)
 	cc_uv = div_s64(cc_raw * BMS_CC_READING_RESOLUTION_N,
 			BMS_CC_READING_RESOLUTION_D);
 
+	/* ignore polarity */
+	cc_uv = abs(cc_uv);
+
 	/* adjust for gain */
 	cc_uv = div_s64(cc_uv * 3291, 100); // Value of 100 <- should be calculated
 
@@ -377,11 +384,27 @@ err_lock:
 	mutex_unlock(&di->bms_output_lock);
 }
 
+static int bms_get_status(struct bms_device_info *di, int *status)
+{
+	int ret;
+
+	ret = power_supply_am_i_supplied(di->batt_psy);
+	if (ret < 0) {
+		*status = POWER_SUPPLY_STATUS_UNKNOWN;
+	} else if (ret == 0) {
+		*status = POWER_SUPPLY_STATUS_DISCHARGING;
+	} else {
+		*status = POWER_SUPPLY_STATUS_CHARGING;
+		ret = 0;
+	}
+	return ret;
+}
+
 static int bms_calculate_capacity(struct bms_device_info *di, int *capacity)
 {
 	unsigned long fcc;
-	int ret, temp, ocv_capacity, temp_degc;
-	s64 cc = 0;
+	int ret, temp, ocv_capacity, temp_degc, status;
+	s64 delta_cc, cc = 0;
 
 	ret = iio_read_channel_raw(di->adc, &temp);
 	if (ret < 0) {
@@ -399,6 +422,18 @@ static int bms_calculate_capacity(struct bms_device_info *di, int *capacity)
 		dev_err(di->dev, "failed to read coulomb counter: %d\n", ret);
 		return ret;
 	}
+
+	delta_cc = cc - di->prev_cc_uah;
+	di->prev_cc_uah = cc;
+
+	ret = bms_get_status(di, &status);
+	if (ret < 0) {
+		dev_err(di->dev, "failed to get charging status: %d\n", ret);
+		return ret;
+	}
+
+	di->cc_uah += (status == POWER_SUPPLY_STATUS_CHARGING) ? delta_cc : -delta_cc;
+	cc = di->cc_uah;
 
 	/* interpolate capacity (in %) from open circuit voltage */
 	// get 'perfect' percentage for ocv at temperature according to table => 72%
@@ -424,6 +459,7 @@ static int bms_calculate_capacity(struct bms_device_info *di, int *capacity)
 	// (1728576 μAh - $cc μAh) * 100 / 2400800 μAh => 30.34%
 	*capacity = div_s64((*capacity + cc) * 100, fcc);
 
+	dev_dbg(di->dev, "delta_cc: %lld, cc: %lld, capacity: %d\n", delta_cc, cc, *capacity);
 	return 0;
 }
 
@@ -438,6 +474,9 @@ static int bms_get_property(struct power_supply *psy,
 	int ret;
 
 	switch (psp) {
+	case POWER_SUPPLY_PROP_STATUS:
+		ret = bms_get_status(di, &val->intval);
+		break;
 	case POWER_SUPPLY_PROP_CAPACITY:
 		ret = bms_calculate_capacity(di, &val->intval);
 		break;
@@ -446,15 +485,33 @@ static int bms_get_property(struct power_supply *psy,
 		break;
 	}
 
-	if (val->intval == INT_MAX || val->intval == INT_MIN)
-		ret = -EINVAL;
+//	if (val->intval == INT_MAX || val->intval == INT_MIN)
+//		ret = -EINVAL;
 
 	return ret;
 }
 
 static enum power_supply_property bms_props[] = {
+	POWER_SUPPLY_PROP_STATUS,
 	POWER_SUPPLY_PROP_CAPACITY,
 };
+
+static void bms_external_power_changed(struct power_supply *psy)
+{
+	struct bms_device_info *di = power_supply_get_drvdata(psy);
+	int ret;
+	int status;
+
+	ret = bms_get_status(di, &status);
+
+	if (!ret && (di->status != status)) {
+		dev_info(di->dev, "Power supply changed state %d -> %d",
+			 di->status, status);
+		di->status = status;
+		power_supply_changed(psy);
+	}
+}
+
 
 static irqreturn_t bms_ocv_thr_irq_handler(int irq, void *dev_id)
 {
@@ -480,6 +537,8 @@ static int bms_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	di->dev = &pdev->dev;
+	di->cc_uah = 0;
+	di->prev_cc_uah = 0;
 
 	di->regmap = dev_get_regmap(pdev->dev.parent, NULL);
 	if (!di->regmap) {
@@ -495,6 +554,7 @@ static int bms_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return ret;
 
+	major = minor = 0;
 	ret = bms_read_version(di, &major, &minor);
 	if (ret < 0)
 		return ret;
@@ -543,6 +603,7 @@ static int bms_probe(struct platform_device *pdev)
 	di->bat_desc.properties = bms_props;
 	di->bat_desc.num_properties = ARRAY_SIZE(bms_props);
 	di->bat_desc.get_property = bms_get_property;
+	di->bat_desc.external_power_changed = bms_external_power_changed;
 
 	psy_cfg.drv_data = di;
 	psy_cfg.of_node = di->dev->of_node;
@@ -552,6 +613,7 @@ static int bms_probe(struct platform_device *pdev)
 		dev_err(di->dev, "failed to register battery: %ld\n", PTR_ERR(bat));
 		return PTR_ERR(bat);
 	}
+	di->batt_psy = bat;
 
 	ret = power_supply_get_battery_info(bat, &di->info);
 	if (ret < 0) {
