@@ -20,6 +20,7 @@
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/reset/aml_gxbb.h>
 #include "amlogic/mesongxbb.dtsi"
+#include "c64_matrix-keypad.dtsi"
 
 / {
 	compatible = "amlogic, Gxbb";
@@ -812,7 +813,7 @@
 		compatible = "spi-gpio";
 		#address-cells = <1>;
 		#size-cells = <0>;
-		status = "ok";
+		status = "disabled";
 		id = <0>;
 		gpio-sck  = <&gpio GPIOX_2 0>;
 		gpio-miso = <&gpio GPIOX_4 0>;

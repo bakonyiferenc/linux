@@ -14,6 +14,9 @@ Required Properties:
 - col-gpios:		List of gpios used as column lines. The gpio specifier
 			for this property depends on the gpio controller to
 			which these column lines are connected.
+- col-switch-delay-ms:	columns switch interval in milliseconds instead
+			of using interrupts to detect key press changes,
+			enables polling mode when specified
 - linux,keymap:		The definition can be found at
 			bindings/input/matrix-keymap.txt
 

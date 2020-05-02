@@ -35,28 +35,32 @@ struct matrix_keypad {
 
 	uint32_t last_key_state[MATRIX_MAX_COLS];
 	struct delayed_work work;
+	struct delayed_work work_switch_column;
 	spinlock_t lock;
 	bool scan_pending;
 	bool stopped;
 	bool gpio_all_disabled;
+	unsigned int col_to_poll;
 };
 
 /*
  * NOTE: normally the GPIO has to be put into HiZ when de-activated to cause
  * minmal side effect when scanning other columns, here it is configured to
- * be input, and it should work on most platforms.
+ * be input, and it should work on most platforms. Except for Odroid C2 where
+ * pullups and pulldowns at inputs are mixed.
  */
 static void __activate_col(const struct matrix_keypad_platform_data *pdata,
 			   int col, bool on)
 {
-	bool level_on = !pdata->active_low;
-
-	if (on) {
-		gpio_direction_output(pdata->col_gpios[col], level_on);
-	} else {
-		gpio_set_value_cansleep(pdata->col_gpios[col], !level_on);
-		gpio_direction_input(pdata->col_gpios[col]);
-	}
+//	bool level_on = !(pdata->col_gpio_flags[col] & OF_GPIO_ACTIVE_LOW);
+//
+//	if (on) {
+//		gpio_direction_output(pdata->col_gpios[col], level_on);
+//	} else {
+//		gpio_set_value_cansleep(pdata->col_gpios[col], !level_on);
+//		gpio_direction_input(pdata->col_gpios[col]);
+//	}
+	gpio_direction_output(pdata->col_gpios[col], on);
 }
 
 static void activate_col(const struct matrix_keypad_platform_data *pdata,
@@ -80,20 +84,54 @@ static void activate_all_cols(const struct matrix_keypad_platform_data *pdata,
 static bool row_asserted(const struct matrix_keypad_platform_data *pdata,
 			 int row)
 {
+	bool level_on = !(pdata->row_gpio_flags[row] & OF_GPIO_ACTIVE_LOW);
+
 	return gpio_get_value_cansleep(pdata->row_gpios[row]) ?
-			!pdata->active_low : pdata->active_low;
+			level_on : !level_on;
+}
+
+/*
+ * this routine fetches the status of all rows within the specified
+ * column, the column will get selected and deselected before and after
+ * sampling the row status
+ */
+static uint32_t sample_rows_for_col(struct matrix_keypad *keypad, int col)
+{
+	const struct matrix_keypad_platform_data *pdata;
+	uint32_t row_state;
+	int row;
+
+	pdata = keypad->pdata;
+
+	row_state = 0;
+	activate_all_cols(pdata, false);
+	activate_col(pdata, col, true);
+	for (row = 0; row < pdata->num_row_gpios; row++)
+		if (!(pdata->row_gpio_flags[row] & OF_GPIO_ACTIVE_LOW))
+			row_state |= row_asserted(pdata, row) ? (1 << row) : 0;
+	activate_all_cols(pdata, true);
+	activate_col(pdata, col, false);
+	for (row = 0; row < pdata->num_row_gpios; row++)
+		if (pdata->row_gpio_flags[row] & OF_GPIO_ACTIVE_LOW)
+			row_state |= row_asserted(pdata, row) ? (1 << row) : 0;
+
+	return row_state;
 }
 
 static void enable_row_irqs(struct matrix_keypad *keypad)
 {
 	const struct matrix_keypad_platform_data *pdata = keypad->pdata;
 	int i;
+	unsigned long jiffies;
 
-	if (pdata->clustered_irq > 0)
+	if (pdata->clustered_irq > 0) {
 		enable_irq(pdata->clustered_irq);
-	else {
+	} else if (!pdata->col_switch_delay_ms) {
 		for (i = 0; i < pdata->num_row_gpios; i++)
 			enable_irq(gpio_to_irq(pdata->row_gpios[i]));
+	} else {
+		jiffies = msecs_to_jiffies(pdata->col_switch_delay_ms);
+		schedule_delayed_work(&keypad->work_switch_column, jiffies);
 	}
 }
 
@@ -102,11 +140,13 @@ static void disable_row_irqs(struct matrix_keypad *keypad)
 	const struct matrix_keypad_platform_data *pdata = keypad->pdata;
 	int i;
 
-	if (pdata->clustered_irq > 0)
+	if (pdata->clustered_irq > 0) {
 		disable_irq_nosync(pdata->clustered_irq);
-	else {
+	} else if (!pdata->col_switch_delay_ms) {
 		for (i = 0; i < pdata->num_row_gpios; i++)
 			disable_irq_nosync(gpio_to_irq(pdata->row_gpios[i]));
+	} else {
+		cancel_delayed_work(&keypad->work_switch_column);
 	}
 }
 
@@ -122,24 +162,18 @@ static void matrix_keypad_scan(struct work_struct *work)
 	const struct matrix_keypad_platform_data *pdata = keypad->pdata;
 	uint32_t new_state[MATRIX_MAX_COLS];
 	int row, col, code;
+	int has_events;
 
 	/* de-activate all columns for scanning */
 	activate_all_cols(pdata, false);
 
-	memset(new_state, 0, sizeof(new_state));
-
 	/* assert each column and read the row status out */
-	for (col = 0; col < pdata->num_col_gpios; col++) {
-
-		activate_col(pdata, col, true);
-
-		for (row = 0; row < pdata->num_row_gpios; row++)
-			new_state[col] |=
-				row_asserted(pdata, row) ? (1 << row) : 0;
-
-		activate_col(pdata, col, false);
-	}
-
+	memset(new_state, 0, sizeof(new_state));
+	for (col = 0; col < pdata->num_col_gpios; col++)
+		new_state[col] = sample_rows_for_col(keypad, col);
+	
+	/* detect changes and derive input events, update the snapshot */
+	has_events = 0;
 	for (col = 0; col < pdata->num_col_gpios; col++) {
 		uint32_t bits_changed;
 
@@ -156,9 +190,11 @@ static void matrix_keypad_scan(struct work_struct *work)
 			input_report_key(input_dev,
 					 keycodes[code],
 					 new_state[col] & (1 << row));
+			has_events++;
 		}
 	}
-	input_sync(input_dev);
+	if (has_events)
+		input_sync(input_dev);
 
 	memcpy(keypad->last_key_state, new_state, sizeof(new_state));
 
@@ -196,6 +232,58 @@ out:
 	return IRQ_HANDLED;
 }
 
+/*
+ * delayed work routine, periodically switching columns and checking the
+ * key press status, to detect changes without interrupt support
+ *
+ * this routine is the polling mode counterpart to the above interrupt handler
+ */
+static void matrix_keypad_switch(struct work_struct *work)
+{
+	struct matrix_keypad *keypad = container_of(work, struct matrix_keypad,
+						    work_switch_column.work);
+	const struct matrix_keypad_platform_data *pdata = keypad->pdata;
+	int col;
+	uint32_t curr_state, prev_state;
+	unsigned long jiffies;
+
+	/* avoid multiple injection, and cope with shutdowns */
+	if (unlikely(keypad->scan_pending || keypad->stopped))
+		return;
+
+	/*
+	 * advance to the next column (avoids modulo calculation
+	 * since that might be too expensive in the absence of
+	 * compile time constants)
+	 */
+	keypad->col_to_poll++;
+	if (keypad->col_to_poll >= pdata->num_col_gpios)
+		keypad->col_to_poll = 0;
+	col = keypad->col_to_poll;
+
+	/*
+	 * sample the row status for this specific column, schedule
+	 * for the next column switch in the absence of changes
+	 */
+	curr_state = sample_rows_for_col(keypad, col);
+	prev_state = keypad->last_key_state[col];
+	if (curr_state == prev_state) {
+		jiffies = msecs_to_jiffies(pdata->col_switch_delay_ms);
+		schedule_delayed_work(&keypad->work_switch_column, jiffies);
+		return;
+	}
+
+	/*
+	 * start the debounce interval when a change was detected,
+	 * cease further polling until the matrix scan has completed
+	 * (polling automatically gets re-started after the scan)
+	 */
+	disable_row_irqs(keypad);
+	keypad->scan_pending = true;
+	jiffies = msecs_to_jiffies(keypad->pdata->debounce_ms);
+	schedule_delayed_work(&keypad->work, jiffies);
+}
+
 static int matrix_keypad_start(struct input_dev *dev)
 {
 	struct matrix_keypad *keypad = input_get_drvdata(dev);
@@ -220,6 +308,7 @@ static void matrix_keypad_stop(struct input_dev *dev)
 	keypad->stopped = true;
 	spin_unlock_irq(&keypad->lock);
 
+	flush_work(&keypad->work_switch_column.work);
 	flush_work(&keypad->work.work);
 	/*
 	 * matrix_keypad_scan() will leave IRQs enabled;
@@ -229,6 +318,17 @@ static void matrix_keypad_stop(struct input_dev *dev)
 }
 
 #ifdef CONFIG_PM_SLEEP
+/*
+ * note that software polling may not mix well with interrupt driven
+ * wakeup from power management, since there is no concept of "enabling
+ * all columns at the same time", and any random column may be active
+ * when we get here
+ * 
+ * an appropriate approach might be to have the user specify a column
+ * that shall get activated before sleep, such that a specific and
+ * well-known subset of the keypad matrix can wake up the device
+ */
+
 static void matrix_keypad_enable_wakeup(struct matrix_keypad *keypad)
 {
 	const struct matrix_keypad_platform_data *pdata = keypad->pdata;
@@ -249,6 +349,8 @@ static void matrix_keypad_enable_wakeup(struct matrix_keypad *keypad)
 			}
 		}
 	}
+
+	/* TODO activate a potentially user specified column */
 }
 
 static void matrix_keypad_disable_wakeup(struct matrix_keypad *keypad)
@@ -318,7 +420,7 @@ static int matrix_keypad_init_gpio(struct platform_device *pdev,
 			goto err_free_cols;
 		}
 
-		gpio_direction_output(pdata->col_gpios[i], !pdata->active_low);
+		gpio_direction_output(pdata->col_gpios[i], true);
 	}
 
 	for (i = 0; i < pdata->num_row_gpios; i++) {
@@ -343,7 +445,7 @@ static int matrix_keypad_init_gpio(struct platform_device *pdev,
 				"Unable to acquire clustered interrupt\n");
 			goto err_free_rows;
 		}
-	} else {
+	} else if (!pdata->col_switch_delay_ms) {
 		for (i = 0; i < pdata->num_row_gpios; i++) {
 			err = request_irq(gpio_to_irq(pdata->row_gpios[i]),
 					matrix_keypad_interrupt,
@@ -385,7 +487,7 @@ static void matrix_keypad_free_gpio(struct matrix_keypad *keypad)
 
 	if (pdata->clustered_irq > 0) {
 		free_irq(pdata->clustered_irq, keypad);
-	} else {
+	} else if (!pdata->col_switch_delay_ms) {
 		for (i = 0; i < pdata->num_row_gpios; i++)
 			free_irq(gpio_to_irq(pdata->row_gpios[i]), keypad);
 	}
@@ -404,7 +506,9 @@ matrix_keypad_parse_dt(struct device *dev)
 	struct matrix_keypad_platform_data *pdata;
 	struct device_node *np = dev->of_node;
 	unsigned int *gpios;
+	unsigned int *gpio_flags;
 	int ret, i, nrow, ncol;
+	enum of_gpio_flags flags = 0;
 
 	if (!np) {
 		dev_err(dev, "device lacks DT data\n");
@@ -428,12 +532,12 @@ matrix_keypad_parse_dt(struct device *dev)
 		pdata->no_autorepeat = true;
 	if (of_get_property(np, "linux,wakeup", NULL))
 		pdata->wakeup = true;
-	if (of_get_property(np, "gpio-activelow", NULL))
-		pdata->active_low = true;
 
 	of_property_read_u32(np, "debounce-delay-ms", &pdata->debounce_ms);
 	of_property_read_u32(np, "col-scan-delay-us",
-						&pdata->col_scan_delay_us);
+			     &pdata->col_scan_delay_us);
+	of_property_read_u32(np, "col-switch-delay-ms",
+			     &pdata->col_switch_delay_ms);
 
 	gpios = devm_kzalloc(dev,
 			     sizeof(unsigned int) *
@@ -444,22 +548,35 @@ matrix_keypad_parse_dt(struct device *dev)
 		return ERR_PTR(-ENOMEM);
 	}
 
+	gpio_flags = devm_kzalloc(dev,
+			     sizeof(unsigned int) *
+				(pdata->num_row_gpios + pdata->num_col_gpios),
+			     GFP_KERNEL);
+	if (!gpio_flags) {
+		dev_err(dev, "could not allocate memory for gpio flags\n");
+		return ERR_PTR(-ENOMEM);
+	}
+
 	for (i = 0; i < nrow; i++) {
-		ret = of_get_named_gpio(np, "row-gpios", i);
+		ret = of_get_named_gpio_flags(np, "row-gpios", i, &flags);
 		if (ret < 0)
 			return ERR_PTR(ret);
 		gpios[i] = ret;
+		gpio_flags[i] = flags;
 	}
 
 	for (i = 0; i < ncol; i++) {
-		ret = of_get_named_gpio(np, "col-gpios", i);
+		ret = of_get_named_gpio_flags(np, "col-gpios", i, &flags);
 		if (ret < 0)
 			return ERR_PTR(ret);
 		gpios[nrow + i] = ret;
+		gpio_flags[nrow + i] = flags;
 	}
 
 	pdata->row_gpios = gpios;
 	pdata->col_gpios = &gpios[pdata->num_row_gpios];
+	pdata->row_gpio_flags = gpio_flags;
+	pdata->col_gpio_flags = &gpio_flags[pdata->num_row_gpios];
 
 	return pdata;
 }
@@ -502,6 +619,8 @@ static int matrix_keypad_probe(struct platform_device *pdev)
 	keypad->row_shift = get_count_order(pdata->num_col_gpios);
 	keypad->stopped = true;
 	INIT_DELAYED_WORK(&keypad->work, matrix_keypad_scan);
+	INIT_DELAYED_WORK(&keypad->work_switch_column, matrix_keypad_switch);
+	keypad->col_to_poll = pdata->num_col_gpios;
 	spin_lock_init(&keypad->lock);
 
 	input_dev->name		= pdev->name;

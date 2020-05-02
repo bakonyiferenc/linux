@@ -1,0 +1,105 @@
+/*
+ * Copyright (C) 2020 Ferenc Bakonyi
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ */
+
+/ {
+	matrix_keypad: matrix_keypad@0 {
+			compatible = "gpio-matrix-keypad";
+			debounce-delay-ms = <5>;
+			col-scan-delay-us = <2>;
+			col-switch-delay-ms = <10>; /* Value > 0 needed for polling mode */
+				     /* GPIO_PULL_UP is not exist yet, use GPIO_ACTIVE_LOW instead */
+			col-gpios = <
+				     &gpio GPIOX_19 GPIO_ACTIVE_LOW		/* pin11 #247 */
+				     &gpio GPIOX_10 GPIO_ACTIVE_HIGH		/* pin12 #238 */
+				     &gpio GPIOX_11 GPIO_ACTIVE_LOW		/* pin13 #239 */
+				     &gpio GPIOX_9  GPIO_ACTIVE_LOW		/* pin15 #237 */
+				     &gpio GPIOX_8  GPIO_ACTIVE_LOW		/* pin16 #236 */
+				     &gpio GPIOX_5  GPIO_ACTIVE_LOW		/* pin18 #233 */
+				     &gpio GPIOX_4  GPIO_ACTIVE_LOW		/* pin21 #232 */
+				     &gpio GPIOY_14 GPIO_ACTIVE_HIGH		/* pin26 #225 */
+				    >;
+			row-gpios = <
+				     &gpio GPIOX_2  GPIO_ACTIVE_LOW		/* pin23 #230 */
+				     &gpio GPIOX_1  GPIO_ACTIVE_LOW		/* pin24 #229 */
+				     &gpio GPIOX_3  GPIO_ACTIVE_LOW		/* pin22 #231 */
+				     &gpio GPIOX_0  GPIO_ACTIVE_LOW		/* pin29 #228 */
+				     &gpio GPIOY_8  GPIO_ACTIVE_LOW		/* pin31 #219 */
+				     &gpio GPIOY_13 GPIO_ACTIVE_LOW		/* pin32 #224 */
+				     &gpio GPIOY_3  GPIO_ACTIVE_LOW		/* pin35 #214 */
+				     &gpio GPIOY_7  GPIO_ACTIVE_LOW		/* pin36 #218 */
+				    >;
+			linux,keymap = <		/* row, col, keycode */
+					0x00000002	/* 1 */
+					0x00010004	/* 3 */
+					0x00020006	/* 5 */
+					0x00030008	/* 7 */
+					0x0004000a	/* 9 */
+					0x0005004e	/* + */
+					0x00060029	/* pound */
+					0x0007000e	/* inst del */
+					0x01000001	/* <- */
+					0x01010011	/* W */
+					0x01020013	/* R */
+					0x01030015	/* Y */
+					0x01040017	/* I */
+					0x01050019	/* P */
+					0x01060037	/* * */
+					0x0107001c	/* return */
+					0x0200001d	/* ctrl */
+					0x0201001e	/* A */
+					0x02020020	/* D */
+					0x02030022	/* G */
+					0x02040024	/* J */
+					0x02050026	/* L */
+					0x02060027	/* ; */
+					0x0207006a	/* crsr l-r */
+					0x03000077	/* run stop */
+					0x0301002a	/* left shift */
+					0x0302002d	/* X */
+					0x0303002f	/* V */
+					0x03040031	/* N */
+					0x03050033	/* , */
+					0x03060035	/* / */
+					0x03070067	/* crsr u-d */
+					0x04000039	/* space */
+					0x0401002c	/* Z */
+					0x0402002e	/* C */
+					0x04030030	/* B */
+					0x04040032	/* M */
+					0x04050034	/* . */
+					0x04060036	/* right shift */
+					0x0407003b	/* F1 */
+					0x05000064	/* C= */
+					0x0501001f	/* S */
+					0x05020021	/* F */
+					0x05030023	/* H */
+					0x05040025	/* K */
+					0x05050027	/* : */
+					0x0506000d	/* = */
+					0x0507003d	/* F3 */
+					0x06000010	/* Q */
+					0x06010012	/* E */
+					0x06020014	/* T */
+					0x06030016	/* U */
+					0x06040018	/* O */
+					0x06050028	/* @ */
+					0x0606002b	/* ^ */
+					0x0607003f	/* F5 */
+					0x07000003	/* 2 */
+					0x07010005	/* 4 */
+					0x07020007	/* 6 */
+					0x07030009	/* 8 */
+					0x0704000b	/* 0 */
+					0x0705000c	/* - */
+					0x07060066	/* clr home */
+					0x07070041	/* F7 */
+					>;
+		};
+
+};
+
